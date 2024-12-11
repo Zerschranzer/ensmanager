@@ -112,7 +112,7 @@ handle_arguments() {
             ;;
         *)
             echo -e "${RED}Invalid argument: $1${RESET}"
-            echo -e "${YELLOW}Usage:${RESET} $0 {download|start|stop|restart}"
+            echo -e "${YELLOW}Usage:${RESET} $0 {update|start|stop|restart}"
             exit 1
             ;;
     esac
