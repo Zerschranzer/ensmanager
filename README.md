@@ -1,4 +1,4 @@
-### Enshrouded Server Management Script
+### Enshrouded Server Management Script for Linux
 
 A lightweight Bash script to manage Enshrouded servers using Wine, created as an alternative to Docker. Includes functionality for downloading/updating, starting, stopping, and restarting the server. Works via both an interactive menu and command-line arguments.
 
