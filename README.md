@@ -10,6 +10,8 @@ A lightweight Bash script to manage Enshrouded servers using Wine, created as an
 
 #### Notes:
 - The server files will be installed in the directory where you run the script.
+- The server configuration file is located at `enshrouded-server/enshrouded_server.json`.
+- The Wine prefix is located at `~/.wine/enshrouded_server`.
 
 #### How to Use:
 1. Clone the repository:
