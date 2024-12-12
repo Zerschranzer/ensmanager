@@ -162,6 +162,12 @@ download_server() {
 
 # Start server
 start_server() {
+    # Check if the server is already running
+    if pgrep -f "$SERVER_EXECUTABLE" > /dev/null; then
+        echo -e "${YELLOW}The server is already running.${RESET}"
+        return
+    fi
+
     echo -e "${CYAN}Starting the server in the background using Wine...${RESET}"
     cd "$SERVER_DIR" || exit
     nohup nice -n -10 wine "$SERVER_EXECUTABLE" > "$BASE_DIR/server.log" 2>&1 &
