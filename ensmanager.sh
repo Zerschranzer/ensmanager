@@ -14,23 +14,120 @@ SERVER_EXECUTABLE="enshrouded_server.exe"
 
 # Wine configuration
 export WINEPREFIX="$HOME/.wine/enshrouded_server"
+mkdir -p "$WINEPREFIX"
 
-# Check dependencies
+# Advanced dependency check
 check_dependencies() {
     local missing=()
-    for dep in "wine" "wget" "tar" "pkill"; do
-        if ! command -v "$dep" &>/dev/null; then
-            missing+=("$dep")
+    local package_manager=""
+    local dependencies=()
+    local config_file="$BASE_DIR/.ens_server_manager_config"
+
+    # Detect the package manager
+    if command -v apt-get >/dev/null 2>&1; then
+        package_manager="apt-get"
+        dependencies=("wget" "tar" "wine" "libc6:i386" "libstdc++6:i386" "libncursesw6:i386" "python3" "libfreetype6:i386" "libfreetype6:amd64" "pkill")
+    elif command -v zypper >/dev/null 2>&1; then
+        package_manager="zypper"
+        dependencies=("wget" "tar" "wine" "libX11-6-32bit" "libX11-devel-32bit" "gcc-32bit" "libexpat1-32bit" "libXext6-32bit" "python3" "pkill" "libfreetype6" "libfreetype6-32bit")
+    elif command -v dnf >/dev/null 2>&1; then
+        package_manager="dnf"
+        dependencies=("wget" "tar" "wine" "glibc-devel.i686" "ncurses-devel.i686" "libstdc++-devel.i686" "python3" "freetype" "procps-ng")
+    elif command -v pacman >/dev/null 2>&1; then
+        package_manager="pacman"
+        dependencies=("wget" "tar" "wine" "lib32-libx11" "gcc-multilib" "lib32-expat" "lib32-libxext" "python" "freetype2")
+    else
+        echo -e "${RED}Error: No supported package manager found on this system.${RESET}"
+        exit 1
+    fi
+
+    # Check for missing dependencies
+    for cmd in "${dependencies[@]}"; do
+        if [ "$package_manager" == "apt-get" ] && [[ "$cmd" == *:i386* || "$cmd" == *:amd64* ]]; then
+            if ! dpkg-query -W -f='${Status}' "$cmd" 2>/dev/null | grep -q "install ok installed"; then
+                missing+=("$cmd")
+            fi
+        elif [ "$package_manager" == "zypper" ]; then
+            if ! rpm -q "${cmd}" >/dev/null 2>&1 && ! command -v "${cmd}" >/dev/null 2>&1; then
+                missing+=("$cmd")
+            fi
+        elif [ "$package_manager" == "dnf" ]; then
+            if ! rpm -q "${cmd}" >/dev/null 2>&1 && ! command -v "${cmd}" >/dev/null 2>&1; then
+                missing+=("$cmd")
+            fi
+        elif [ "$package_manager" == "pacman" ]; then
+            if ! pacman -Qi "${cmd}" >/dev/null 2>&1 && ! ldconfig -p | grep -q "${cmd}"; then
+                missing+=("$cmd")
+            fi
+        elif [ "$cmd" == "pkill" ]; then
+            if ! command -v pkill >/dev/null 2>&1; then
+                missing+=("procps")
+            fi
+        else
+            if ! command -v "${cmd}" >/dev/null 2>&1; then
+                missing+=("$cmd")
+            fi
         fi
     done
 
-    if [ ${#missing[@]} -gt 0 ]; then
-        echo -e "${RED}The following dependencies are missing and need to be installed:${RESET}"
-        for dep in "${missing[@]}"; do
-            echo -e "${YELLOW}- $dep${RESET}"
-        done
-        echo -e "${RED}Please install the missing dependencies and restart the script.${RESET}"
-        exit 1
+    # Report missing dependencies and ask to continue
+    if [ ${#missing[@]} -ne 0 ]; then
+        # Check if the user has chosen to suppress warnings
+        if [ -f "$config_file" ] && grep -q "SUPPRESS_DEPENDENCY_WARNINGS=true" "$config_file"; then
+            echo -e "${YELLOW}Continuing despite missing dependencies (warnings suppressed)...${RESET}"
+            return
+        fi
+
+        echo -e "${RED}Warning: The following required packages are missing: ${missing[*]}${RESET}"
+        echo -e "${CYAN}Please install them using the appropriate command for your system:${RESET}"
+        case $package_manager in
+            "apt-get")
+                echo -e "${MAGENTA}sudo dpkg --add-architecture i386${RESET}"
+                echo -e "${MAGENTA}sudo apt update${RESET}"
+                echo -e "${MAGENTA}sudo apt-get install ${YELLOW}${missing[*]}${RESET}"
+                ;;
+            "zypper")
+                echo -e "${MAGENTA}sudo zypper install ${YELLOW}${missing[*]}${RESET}"
+                ;;
+            "dnf")
+                echo -e "${MAGENTA}sudo dnf install ${YELLOW}${missing[*]}${RESET}"
+                ;;
+            "pacman")
+                echo -e "${BLUE}For Arch Linux users:${RESET}"
+                echo -e "${CYAN}1. Edit the pacman configuration file:${RESET}"
+                echo -e "   ${MAGENTA}sudo nano /etc/pacman.conf${RESET}"
+                echo
+                echo -e "${CYAN}2. Find and uncomment the following lines to enable the multilib repository:${RESET}"
+                echo -e "   ${GREEN}[multilib]${RESET}"
+                echo -e "   ${GREEN}Include = /etc/pacman.d/mirrorlist${RESET}"
+                echo
+                echo -e "${CYAN}3. Save the file and exit the editor${RESET}"
+                echo
+                echo -e "${CYAN}4. Update the package database:${RESET}"
+                echo -e "   ${MAGENTA}sudo pacman -Sy${RESET}"
+                echo
+                echo -e "${CYAN}5. Install the missing packages:${RESET}"
+                echo -e "   ${MAGENTA}sudo pacman -S ${YELLOW}${missing[*]}${RESET}"
+                ;;
+        esac
+
+        echo -e "\n"
+        echo -e "${YELLOW}Continue anyway?${RESET} ${RED}(not recommended)${RESET} ${YELLOW}[y/N]${RESET}"
+        read -r response
+        if [[ ! $response =~ ^[Yy]$ ]]; then
+            echo -e "${RED}Exiting due to missing dependencies.${RESET}"
+            exit 1
+        fi
+
+        echo
+        echo -e "${YELLOW}Do you want to suppress this warning in the future? [y/N]${RESET}"
+        read -r suppress_response
+        if [[ $suppress_response =~ ^[Yy]$ ]]; then
+            echo "SUPPRESS_DEPENDENCY_WARNINGS=true" >> "$config_file"
+            echo -e "${GREEN}Dependency warnings will be suppressed in future runs.${RESET}"
+        fi
+
+        echo -e "${YELLOW}Continuing despite missing dependencies...${RESET}"
     fi
 }
 
