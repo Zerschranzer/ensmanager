@@ -70,6 +70,30 @@ CLI overview:
 ./ensmanager.sh restart-proton  # GE-Proton
 ./ensmanager.sh install-proton
 ./ensmanager.sh update-proton
+./ensmanager.sh run            # foreground, for systemd
+```
+
+`run` keeps the Proton process in the foreground and forwards SIGTERM/SIGINT
+to the server as SIGINT, so a service stop still writes a save.
+
+#### systemd (optional)
+
+```ini
+[Unit]
+Description=Enshrouded Dedicated Server
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/ensmanager
+ExecStart=/path/to/ensmanager/ensmanager.sh run
+KillSignal=SIGTERM
+TimeoutStopSec=120
+Restart=on-failure
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target
 ```
 
 Lean and efficient—perfect for those who prefer simplicity over bloated containers.

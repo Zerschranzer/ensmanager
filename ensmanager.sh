@@ -345,12 +345,8 @@ require_xvfb() {
     return 1
 }
 
-# Start server with GE-Proton (optional runtime)
-start_proton() {
-    if pgrep -f "$SERVER_EXECUTABLE" > /dev/null; then
-        echo -e "${YELLOW}The server is already running.${RESET}"
-        return
-    fi
+# Shared checks before launching Proton
+prepare_proton_start() {
     if [ ! -f "$SERVER_DIR/$SERVER_EXECUTABLE" ]; then
         echo -e "${RED}Server files not found. Run \"$0 update\" first.${RESET}"
         return 1
@@ -362,6 +358,15 @@ start_proton() {
     require_xvfb || return 1
     ensure_steam_sdk || return 1
     mkdir -p "$PROTON_DATA_DIR" || return 1
+}
+
+# Start server with GE-Proton (optional runtime)
+start_proton() {
+    if pgrep -f "$SERVER_EXECUTABLE" > /dev/null; then
+        echo -e "${YELLOW}The server is already running.${RESET}"
+        return
+    fi
+    prepare_proton_start || return 1
 
     echo -e "${CYAN}Starting the server in the background using $(proton_installed_version 2>/dev/null || echo "GE-Proton")...${RESET}"
     (
@@ -431,6 +436,56 @@ restart_proton() {
     start_proton
 }
 
+# Find the Windows server process (comm is truncated to "enshrouded_serv")
+find_server_pid() {
+    local p
+    for p in $(pgrep -f "$SERVER_EXECUTABLE" 2>/dev/null); do
+        case "$(cat "/proc/$p/comm" 2>/dev/null)" in
+            enshrouded*) echo "$p"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Run server in the foreground (systemd); SIGTERM/SIGINT -> graceful save
+run_server() {
+    if pgrep -f "$SERVER_EXECUTABLE" > /dev/null; then
+        echo -e "${YELLOW}The server is already running.${RESET}"
+        return 1
+    fi
+    prepare_proton_start || return 1
+
+    echo -e "${CYAN}Starting the server in the foreground using $(proton_installed_version 2>/dev/null || echo "GE-Proton")...${RESET}"
+    export STEAM_COMPAT_CLIENT_INSTALL_PATH="$BASE_DIR/steamcmd"
+    export STEAM_COMPAT_DATA_PATH="$PROTON_DATA_DIR"
+    export PROTON_USE_XALIA=0
+    unset DISPLAY
+    cd "$SERVER_DIR" || return 1
+
+    xvfb-run -a "$PROTON_LINK/proton" run "./$SERVER_EXECUTABLE" &
+    local launcher_pid=$!
+    local app_pid=""
+    local i
+    for i in $(seq 1 180); do
+        app_pid="$(find_server_pid)" && break
+        kill -0 "$launcher_pid" 2>/dev/null || break
+        sleep 1
+    done
+    if [ -z "$app_pid" ]; then
+        echo -e "${RED}Server process did not start.${RESET}"
+        wait "$launcher_pid" 2>/dev/null
+        return 1
+    fi
+    echo -e "${GREEN}Server running (PID $app_pid). Send SIGINT/SIGTERM for a graceful stop.${RESET}"
+
+    trap 'kill -INT "$app_pid" 2>/dev/null' INT TERM
+    while kill -0 "$app_pid" 2>/dev/null; do
+        sleep 2
+    done
+    wait "$launcher_pid" 2>/dev/null
+    echo -e "${CYAN}Server exited.${RESET}"
+}
+
 # Handle CLI arguments
 handle_arguments() {
     case "$1" in
@@ -452,12 +507,15 @@ handle_arguments() {
         restart-proton)
             restart_proton
             ;;
+        run|foreground)
+            run_server
+            ;;
         install-proton|update-proton)
             install_proton
             ;;
         *)
             echo -e "${RED}Invalid argument: $1${RESET}"
-            echo -e "${YELLOW}Usage:${RESET} $0 {update|start|start-proton|stop|restart|restart-proton|install-proton|update-proton}"
+            echo -e "${YELLOW}Usage:${RESET} $0 {update|start|start-proton|stop|restart|restart-proton|run|install-proton|update-proton}"
             exit 1
             ;;
     esac
