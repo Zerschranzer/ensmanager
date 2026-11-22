@@ -22,6 +22,21 @@ PROTON_TOOLS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/Steam/compatibilitytools.
 PROTON_LINK="$PROTON_TOOLS_DIR/GE-Proton"
 PROTON_DATA_DIR="${PROTON_DATA_DIR:-$BASE_DIR/proton-data}"
 STEAM_SDK_DIR="$HOME/.steam/sdk64"
+SERVER_UID="$(id -u)"
+
+# Match only this user's server, so other users' instances are left alone
+server_running() {
+    pgrep -u "$SERVER_UID" -f "$SERVER_EXECUTABLE" >/dev/null
+}
+
+# Signal this user's server processes (pgrep/pkill -f ignores other users)
+signal_servers() {
+    local signal="$1"
+    local pids
+    pids="$(pgrep -u "$SERVER_UID" -f "$SERVER_EXECUTABLE" 2>/dev/null)"
+    [ -n "$pids" ] && kill "-$signal" $pids 2>/dev/null
+    return 0
+}
 
 # Advanced dependency check
 check_dependencies() {
@@ -170,7 +185,7 @@ download_server() {
 # Start server
 start_server() {
     # Check if the server is already running
-    if pgrep -f "$SERVER_EXECUTABLE" > /dev/null; then
+    if server_running; then
         echo -e "${YELLOW}The server is already running.${RESET}"
         return
     fi
@@ -362,7 +377,7 @@ prepare_proton_start() {
 
 # Start server with GE-Proton (optional runtime)
 start_proton() {
-    if pgrep -f "$SERVER_EXECUTABLE" > /dev/null; then
+    if server_running; then
         echo -e "${YELLOW}The server is already running.${RESET}"
         return
     fi
@@ -390,30 +405,30 @@ start_proton() {
 # Stop server (SIGINT -> graceful save, then TERM/KILL as fallback)
 stop_server() {
     echo -e "${CYAN}Stopping all processes related to the Enshrouded server...${RESET}"
-    if ! pgrep -f "$SERVER_EXECUTABLE" >/dev/null; then
+    if ! server_running; then
         echo -e "${YELLOW}The server is not running.${RESET}"
         return
     fi
 
-    pkill -INT -f "$SERVER_EXECUTABLE" 2>/dev/null
+    signal_servers INT
     local waited=0
-    while pgrep -f "$SERVER_EXECUTABLE" >/dev/null && [ $waited -lt 75 ]; do
+    while server_running && [ $waited -lt 75 ]; do
         sleep 1
         waited=$((waited + 1))
     done
 
-    if pgrep -f "$SERVER_EXECUTABLE" >/dev/null; then
+    if server_running; then
         echo -e "${YELLOW}Graceful shutdown timed out, sending SIGTERM...${RESET}"
-        pkill -TERM -f "$SERVER_EXECUTABLE" 2>/dev/null
+        signal_servers TERM
         sleep 5
     fi
-    if pgrep -f "$SERVER_EXECUTABLE" >/dev/null; then
+    if server_running; then
         echo -e "${RED}Processes still alive, sending SIGKILL.${RESET}"
-        pkill -KILL -f "$SERVER_EXECUTABLE" 2>/dev/null
+        signal_servers KILL
         sleep 1
     fi
 
-    if pgrep -f "$SERVER_EXECUTABLE" >/dev/null; then
+    if server_running; then
         echo -e "${RED}Some server processes could not be stopped. Please check manually.${RESET}"
     else
         echo -e "${GREEN}Server successfully stopped.${RESET}"
@@ -439,7 +454,7 @@ restart_proton() {
 # Find the Windows server process (comm is truncated to "enshrouded_serv")
 find_server_pid() {
     local p
-    for p in $(pgrep -f "$SERVER_EXECUTABLE" 2>/dev/null); do
+    for p in $(pgrep -u "$SERVER_UID" -f "$SERVER_EXECUTABLE" 2>/dev/null); do
         case "$(cat "/proc/$p/comm" 2>/dev/null)" in
             enshrouded*) echo "$p"; return 0 ;;
         esac
@@ -449,7 +464,7 @@ find_server_pid() {
 
 # Run server in the foreground (systemd); SIGTERM/SIGINT -> graceful save
 run_server() {
-    if pgrep -f "$SERVER_EXECUTABLE" > /dev/null; then
+    if server_running; then
         echo -e "${YELLOW}The server is already running.${RESET}"
         return 1
     fi
