@@ -152,7 +152,7 @@ download_server() {
     setup_steamcmd
     echo -e "${CYAN}Starting the download of the Enshrouded server...${RESET}"
     mkdir -p "$SERVER_DIR"
-    "$BASE_DIR/steamcmd/steamcmd.sh" +@sSteamCmdForcePlatformType windows +force_install_dir "$SERVER_DIR" +login anonymous +app_update 2278520 validate +quit
+    "$BASE_DIR/steamcmd/steamcmd.sh" +@sSteamCmdForcePlatformType windows +@sSteamCmdForcePlatformBitness 64 +force_install_dir "$SERVER_DIR" +login anonymous +app_update 2278520 validate +quit
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}The server was successfully downloaded.${RESET}"
     else
@@ -170,7 +170,7 @@ start_server() {
 
     echo -e "${CYAN}Starting the server in the background using Wine...${RESET}"
     cd "$SERVER_DIR" || exit
-    nohup nice -n -10 wine "$SERVER_EXECUTABLE" > "$BASE_DIR/server.log" 2>&1 &
+    nohup wine "$SERVER_EXECUTABLE" > "$BASE_DIR/server.log" 2>&1 &
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}Server successfully started in the background.${RESET}"
         echo -e "${YELLOW}Logs are saved in server.log.${RESET}"
@@ -179,10 +179,32 @@ start_server() {
     fi
 }
 
-# Stop server
+# Stop server (SIGINT -> graceful save, then TERM/KILL as fallback)
 stop_server() {
     echo -e "${CYAN}Stopping all processes related to the Enshrouded server...${RESET}"
-    pkill -f "$SERVER_EXECUTABLE"
+    if ! pgrep -f "$SERVER_EXECUTABLE" >/dev/null; then
+        echo -e "${YELLOW}The server is not running.${RESET}"
+        return
+    fi
+
+    pkill -INT -f "$SERVER_EXECUTABLE" 2>/dev/null
+    local waited=0
+    while pgrep -f "$SERVER_EXECUTABLE" >/dev/null && [ $waited -lt 75 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if pgrep -f "$SERVER_EXECUTABLE" >/dev/null; then
+        echo -e "${YELLOW}Graceful shutdown timed out, sending SIGTERM...${RESET}"
+        pkill -TERM -f "$SERVER_EXECUTABLE" 2>/dev/null
+        sleep 5
+    fi
+    if pgrep -f "$SERVER_EXECUTABLE" >/dev/null; then
+        echo -e "${RED}Processes still alive, sending SIGKILL.${RESET}"
+        pkill -KILL -f "$SERVER_EXECUTABLE" 2>/dev/null
+        sleep 1
+    fi
+
     if pgrep -f "$SERVER_EXECUTABLE" >/dev/null; then
         echo -e "${RED}Some server processes could not be stopped. Please check manually.${RESET}"
     else
