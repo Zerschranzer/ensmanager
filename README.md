@@ -6,6 +6,8 @@ A lightweight Bash script to manage Enshrouded servers using Wine or GE-Proton, 
 - Manages server lifecycle: download, update, start, stop, and restart.
 - Two runtimes: system Wine (default) and optional GE-Proton.
 - Installs and updates the latest GE-Proton in the current user's home (no root).
+- Lists installed GE-Proton versions and removes old ones (single or all
+  non-active) through a submenu; the active version is protected.
 - Graceful stop: SIGINT first so the server writes a save, then TERM/KILL as fallback.
 - Logs server output for easier debugging.
 - Simple CLI for automation.
@@ -45,6 +47,10 @@ Proton runtime reduces those warnings.
 ```bash
 ./ensmanager.sh install-proton      # install the latest GE-Proton (user-local)
 ./ensmanager.sh update-proton       # update to the latest release
+./ensmanager.sh list-proton         # show installed versions
+./ensmanager.sh manage-proton       # submenu: remove old versions
+./ensmanager.sh remove-proton GE-Proton11-11
+./ensmanager.sh prune-proton        # remove all versions except the active one
 ./ensmanager.sh start-proton        # start the server with GE-Proton
 ./ensmanager.sh restart-proton
 ```
@@ -70,6 +76,10 @@ CLI overview:
 ./ensmanager.sh restart-proton  # GE-Proton
 ./ensmanager.sh install-proton
 ./ensmanager.sh update-proton
+./ensmanager.sh list-proton       # installed versions
+./ensmanager.sh manage-proton     # remove old versions (submenu)
+./ensmanager.sh remove-proton GE-Proton11-11
+./ensmanager.sh prune-proton      # all except the active version
 ./ensmanager.sh run            # foreground, for systemd
 ```
 

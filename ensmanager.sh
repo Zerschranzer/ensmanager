@@ -326,6 +326,167 @@ install_proton() {
     )
 }
 
+# List installed GE-Proton versions
+list_proton_versions() {
+    local current dir name size found=0
+    current="$(proton_installed_version 2>/dev/null)"
+    if [ ! -d "$PROTON_TOOLS_DIR" ]; then
+        echo -e "${YELLOW}No GE-Proton installations found.${RESET}"
+        return 0
+    fi
+    while IFS= read -r dir; do
+        name="$(basename "$dir")"
+        size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+        if [ "$name" = "$current" ]; then
+            printf "  %-18s %6s  ${GREEN}(current)${RESET}\n" "$name" "${size:-?}"
+        else
+            printf "  %-18s %6s\n" "$name" "${size:-?}"
+        fi
+        found=1
+    done < <(find "$PROTON_TOOLS_DIR" -mindepth 1 -maxdepth 1 -type d -name 'GE-Proton*' 2>/dev/null | sort -V)
+    if [ "$found" -eq 0 ]; then
+        echo -e "  ${YELLOW}(none)${RESET}"
+    fi
+}
+
+# Remove one GE-Proton version (the active one is protected)
+remove_proton_version() {
+    local tag="${1:-}"
+    local current dir size answer
+
+    if [ -z "$tag" ]; then
+        echo -e "${RED}Usage: $0 remove-proton <version>${RESET}"
+        return 1
+    fi
+    if ! [[ "$tag" =~ ^GE-Proton[0-9A-Za-z._-]+$ ]] || [[ "$tag" == *..* ]]; then
+        echo -e "${RED}Invalid version name: $tag${RESET}"
+        return 1
+    fi
+
+    dir="$PROTON_TOOLS_DIR/$tag"
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}GE-Proton $tag is not installed in $PROTON_TOOLS_DIR.${RESET}"
+        return 1
+    fi
+    if [ "$(dirname "$(readlink -f "$dir")")" != "$(readlink -f "$PROTON_TOOLS_DIR")" ]; then
+        echo -e "${RED}Refusing to remove a path outside $PROTON_TOOLS_DIR.${RESET}"
+        return 1
+    fi
+
+    current="$(proton_installed_version 2>/dev/null)"
+    if [ "$tag" = "$current" ]; then
+        echo -e "${RED}$tag is the active GE-Proton version and cannot be removed.${RESET}"
+        echo -e "${YELLOW}Switch first (install/update-proton) or remove it manually after unlinking.${RESET}"
+        return 1
+    fi
+
+    size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+    read -rp "Remove $tag (${size:-unknown size})? [y/N] " answer
+    if [[ ! $answer =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Cancelled.${RESET}"
+        return 0
+    fi
+
+    rm -rf -- "$dir"
+    echo -e "${GREEN}Removed $tag.${RESET}"
+}
+
+# Remove all GE-Proton versions except the active one
+prune_proton_versions() {
+    local current dir name answer total
+    local -a old=()
+
+    current="$(proton_installed_version 2>/dev/null)"
+    if [ -z "$current" ]; then
+        echo -e "${RED}No active GE-Proton version (symlink missing); refusing to prune.${RESET}"
+        echo -e "${YELLOW}Run install-proton/update-proton or fix the GE-Proton symlink first.${RESET}"
+        return 1
+    fi
+    while IFS= read -r dir; do
+        name="$(basename "$dir")"
+        [ "$name" = "$current" ] && continue
+        old+=("$dir")
+    done < <(find "$PROTON_TOOLS_DIR" -mindepth 1 -maxdepth 1 -type d -name 'GE-Proton*' 2>/dev/null | sort -V)
+
+    if [ ${#old[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No older GE-Proton versions to remove.${RESET}"
+        return 0
+    fi
+
+    total="$(du -shc "${old[@]}" 2>/dev/null | tail -1 | cut -f1)"
+    echo -e "${CYAN}Older versions:${RESET}"
+    for dir in "${old[@]}"; do
+        echo -e "  $(basename "$dir")"
+    done
+    read -rp "Remove ${#old[@]} version(s) (${total:-unknown size})? [y/N] " answer
+    if [[ ! $answer =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Cancelled.${RESET}"
+        return 0
+    fi
+
+    for dir in "${old[@]}"; do
+        rm -rf -- "$dir"
+        echo -e "${GREEN}Removed $(basename "$dir").${RESET}"
+    done
+}
+
+# Interactive GE-Proton version manager
+manage_proton_versions() {
+    local current dir name size choice tag i
+    local -a versions=()
+
+    while true; do
+        current="$(proton_installed_version 2>/dev/null)"
+        versions=()
+        while IFS= read -r dir; do
+            versions+=("$dir")
+        done < <(find "$PROTON_TOOLS_DIR" -mindepth 1 -maxdepth 1 -type d -name 'GE-Proton*' 2>/dev/null | sort -V)
+
+        echo -e "${CYAN}-------------------------------------${RESET}"
+        echo -e "${CYAN} GE-Proton versions               ${RESET}"
+        echo -e "${CYAN}-------------------------------------${RESET}"
+        echo -e "${CYAN}Directory:${RESET} ${YELLOW}$PROTON_TOOLS_DIR${RESET}"
+        echo -e "${CYAN}Active:${RESET}    ${YELLOW}${current:-none}${RESET}"
+        echo -e "${CYAN}-------------------------------------${RESET}"
+        if [ ${#versions[@]} -eq 0 ]; then
+            echo -e "  ${YELLOW}(no installed versions)${RESET}"
+        else
+            i=1
+            for dir in "${versions[@]}"; do
+                name="$(basename "$dir")"
+                size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+                if [ "$name" = "$current" ]; then
+                    printf "  %2d) %-18s %6s  ${GREEN}(current)${RESET}\n" "$i" "$name" "${size:-?}"
+                else
+                    printf "  %2d) %-18s %6s\n" "$i" "$name" "${size:-?}"
+                fi
+                i=$((i + 1))
+            done
+        fi
+        echo -e "${CYAN}-------------------------------------${RESET}"
+        echo -e "  ${GREEN}a) Remove all versions except the active one${RESET}"
+        echo -e "  ${GREEN}b) Back${RESET}"
+        read -rp "Remove version number, a, or b: " choice
+
+        case "$choice" in
+            ""|b|B)
+                return 0
+                ;;
+            a|A)
+                prune_proton_versions
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#versions[@]} ]; then
+                    tag="$(basename "${versions[$((choice - 1))]}")"
+                    remove_proton_version "$tag"
+                else
+                    echo -e "${RED}Invalid selection.${RESET}"
+                fi
+                ;;
+        esac
+    done
+}
+
 # Ensure Proton can find the native Steam client library
 ensure_steam_sdk() {
     local lib="$BASE_DIR/steamcmd/linux64/steamclient.so"
@@ -528,9 +689,21 @@ handle_arguments() {
         install-proton|update-proton)
             install_proton
             ;;
+        list-proton|proton-versions)
+            list_proton_versions
+            ;;
+        remove-proton)
+            remove_proton_version "${2:-}"
+            ;;
+        prune-proton|remove-old-proton)
+            prune_proton_versions
+            ;;
+        manage-proton)
+            manage_proton_versions
+            ;;
         *)
             echo -e "${RED}Invalid argument: $1${RESET}"
-            echo -e "${YELLOW}Usage:${RESET} $0 {update|start|start-proton|stop|restart|restart-proton|run|install-proton|update-proton}"
+            echo -e "${YELLOW}Usage:${RESET} $0 {update|start|start-proton|stop|restart|restart-proton|run|install-proton|update-proton|list-proton|remove-proton <version>|prune-proton|manage-proton}"
             exit 1
             ;;
     esac
@@ -554,7 +727,8 @@ show_menu() {
         echo -e "${GREEN}5) Restart server (Wine)${RESET}"
         echo -e "${GREEN}6) Restart server (GE-Proton)${RESET}"
         echo -e "${GREEN}7) Install/Update GE-Proton${RESET}"
-        echo -e "${GREEN}8) Exit${RESET}"
+        echo -e "${GREEN}8) Manage GE-Proton versions${RESET}"
+        echo -e "${GREEN}9) Exit${RESET}"
         echo -e "${CYAN}-------------------------------------${RESET}"
         read -rp "Choose an option: " choice
 
@@ -581,6 +755,9 @@ show_menu() {
                 install_proton
                 ;;
             8)
+                manage_proton_versions
+                ;;
+            9)
                 echo -e "${CYAN}Exiting the script.${RESET}"
                 exit 0
                 ;;
@@ -594,7 +771,7 @@ show_menu() {
 # Main program
 check_dependencies
 if [ $# -gt 0 ]; then
-    handle_arguments "$1"
+    handle_arguments "$@"
 else
     show_menu
 fi
