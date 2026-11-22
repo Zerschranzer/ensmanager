@@ -5,16 +5,38 @@ GREEN="\033[0;32m"
 RED="\033[0;31m"
 YELLOW="\033[0;33m"
 CYAN="\033[0;36m"
+MAGENTA="\033[0;35m"
 RESET="\033[0m"
 
 # Directories and settings
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVER_DIR="$BASE_DIR/enshrouded-server"
+SERVER_DIR="${SERVER_DIR:-$BASE_DIR/enshrouded-server}"
 SERVER_EXECUTABLE="enshrouded_server.exe"
 
 # Wine configuration
 export WINEPREFIX="$HOME/.wine/enshrouded_server"
 mkdir -p "$WINEPREFIX"
+
+# Optional GE-Proton runtime (user-local, no root)
+PROTON_TOOLS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/Steam/compatibilitytools.d"
+PROTON_LINK="$PROTON_TOOLS_DIR/GE-Proton"
+PROTON_DATA_DIR="${PROTON_DATA_DIR:-$BASE_DIR/proton-data}"
+STEAM_SDK_DIR="$HOME/.steam/sdk64"
+SERVER_UID="$(id -u)"
+
+# Match only this user's server, so other users' instances are left alone
+server_running() {
+    pgrep -u "$SERVER_UID" -f "$SERVER_EXECUTABLE" >/dev/null
+}
+
+# Signal this user's server processes (pgrep/pkill -f ignores other users)
+signal_servers() {
+    local signal="$1"
+    local pids
+    pids="$(pgrep -u "$SERVER_UID" -f "$SERVER_EXECUTABLE" 2>/dev/null)"
+    [ -n "$pids" ] && kill "-$signal" $pids 2>/dev/null
+    return 0
+}
 
 # Advanced dependency check
 check_dependencies() {
@@ -152,7 +174,7 @@ download_server() {
     setup_steamcmd
     echo -e "${CYAN}Starting the download of the Enshrouded server...${RESET}"
     mkdir -p "$SERVER_DIR"
-    "$BASE_DIR/steamcmd/steamcmd.sh" +@sSteamCmdForcePlatformType windows +force_install_dir "$SERVER_DIR" +login anonymous +app_update 2278520 validate +quit
+    "$BASE_DIR/steamcmd/steamcmd.sh" +@sSteamCmdForcePlatformType windows +@sSteamCmdForcePlatformBitness 64 +force_install_dir "$SERVER_DIR" +login anonymous +app_update 2278520 validate +quit
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}The server was successfully downloaded.${RESET}"
     else
@@ -163,14 +185,14 @@ download_server() {
 # Start server
 start_server() {
     # Check if the server is already running
-    if pgrep -f "$SERVER_EXECUTABLE" > /dev/null; then
+    if server_running; then
         echo -e "${YELLOW}The server is already running.${RESET}"
         return
     fi
 
     echo -e "${CYAN}Starting the server in the background using Wine...${RESET}"
     cd "$SERVER_DIR" || exit
-    nohup nice -n -10 wine "$SERVER_EXECUTABLE" > "$BASE_DIR/server.log" 2>&1 &
+    nohup wine "$SERVER_EXECUTABLE" > "$BASE_DIR/server.log" 2>&1 &
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}Server successfully started in the background.${RESET}"
         echo -e "${YELLOW}Logs are saved in server.log.${RESET}"
@@ -179,11 +201,395 @@ start_server() {
     fi
 }
 
-# Stop server
+# Installed GE-Proton version (resolved symlink target)
+proton_installed_version() {
+    local target
+    target="$(readlink -f "$PROTON_LINK" 2>/dev/null)" || return 1
+    [ -n "$target" ] && [ -d "$target" ] || return 1
+    basename "$target"
+}
+
+# Fetch latest GE-Proton release tag + x86_64 asset URLs
+proton_latest_release() {
+    local json="$1"
+    python3 - "$json" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        release = json.load(fh)
+except Exception:
+    sys.exit(1)
+
+tag = release.get("tag_name", "")
+assets = {a.get("name", ""): a.get("browser_download_url", "") for a in release.get("assets", [])}
+tarball = f"{tag}-x86_64.tar.gz"
+sumfile = f"{tag}-x86_64.sha512sum"
+if not tag or tarball not in assets or sumfile not in assets:
+    sys.exit(1)
+print(tag)
+print(assets[tarball])
+print(assets[sumfile])
+PY
+}
+
+# Install or update the latest GE-Proton in the current user's home
+install_proton() {
+    local force="${1:-}"
+    local tmp tag url sumurl installed
+    (
+    for tool in wget tar python3 sha512sum; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            echo -e "${RED}Missing tool: $tool${RESET}"
+            return 1
+        fi
+    done
+
+    mkdir -p "$PROTON_TOOLS_DIR" || {
+        echo -e "${RED}Cannot create $PROTON_TOOLS_DIR${RESET}"
+        return 1
+    }
+    tmp="$(mktemp -d "$PROTON_TOOLS_DIR/.ge-proton-download.XXXXXX")" || return 1
+    trap 'rm -rf "$tmp"' EXIT
+
+    echo -e "${CYAN}Fetching latest GE-Proton release info...${RESET}"
+    if ! wget -q -O "$tmp/release.json" "https://api.github.com/repos/GloriousEggroll/proton-ge-custom/releases/latest"; then
+        echo -e "${RED}Could not reach the GitHub API (rate limit or no network).${RESET}"
+        return 1
+    fi
+    if ! mapfile -t release < <(proton_latest_release "$tmp/release.json"); then
+        echo -e "${RED}Could not parse the latest GE-Proton release.${RESET}"
+        return 1
+    fi
+    tag="${release[0]}"
+    url="${release[1]}"
+    sumurl="${release[2]}"
+    if [ -z "$tag" ] || [ -z "$url" ] || [ -z "$sumurl" ]; then
+        echo -e "${RED}Could not parse the latest GE-Proton release.${RESET}"
+        return 1
+    fi
+
+    installed="$(proton_installed_version 2>/dev/null)"
+    if [ "$installed" = "$tag" ] && [ "$force" != "--force" ]; then
+        echo -e "${GREEN}GE-Proton $tag is already installed and current.${RESET}"
+        echo -e "${CYAN}Path:${RESET} $PROTON_LINK"
+        return 0
+    fi
+
+    if [ -n "$installed" ]; then
+        echo -e "${CYAN}Updating GE-Proton $installed -> $tag${RESET}"
+    else
+        echo -e "${CYAN}Installing GE-Proton $tag (user: $USER)${RESET}"
+    fi
+    echo -e "${YELLOW}Download size is about 2 GB.${RESET}"
+
+    if ! wget --progress=dot:giga -O "$tmp/${tag}-x86_64.tar.gz" "$url"; then
+        echo -e "${RED}Download of $tag failed.${RESET}"
+        return 1
+    fi
+    if ! wget -q -O "$tmp/${tag}-x86_64.sha512sum" "$sumurl"; then
+        echo -e "${RED}Download of the checksum failed.${RESET}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Verifying checksum...${RESET}"
+    if ! (cd "$tmp" && sha512sum -c "${tag}-x86_64.sha512sum" >/dev/null 2>&1); then
+        echo -e "${RED}Checksum mismatch - aborting.${RESET}"
+        return 1
+    fi
+
+    echo -e "${CYAN}Extracting...${RESET}"
+    mkdir -p "$tmp/unpacked" || return 1
+    if ! tar -xzf "$tmp/${tag}-x86_64.tar.gz" -C "$tmp/unpacked" --strip-components=1; then
+        echo -e "${RED}Extraction failed.${RESET}"
+        return 1
+    fi
+    if [ ! -x "$tmp/unpacked/proton" ]; then
+        echo -e "${RED}Extracted archive does not contain the proton launcher.${RESET}"
+        return 1
+    fi
+
+    # Install versioned, then atomically repoint the stable symlink.
+    rm -rf "${PROTON_TOOLS_DIR:?}/$tag"
+    if ! mv "$tmp/unpacked" "$PROTON_TOOLS_DIR/$tag"; then
+        echo -e "${RED}Could not install to $PROTON_TOOLS_DIR/$tag${RESET}"
+        return 1
+    fi
+    ln -sfn "$tag" "$PROTON_LINK"
+
+    echo -e "${GREEN}GE-Proton $tag installed.${RESET}"
+    echo -e "${CYAN}Launcher:${RESET} $PROTON_LINK/proton"
+    if [ -n "$installed" ] && [ "$installed" != "$tag" ]; then
+        echo -e "${YELLOW}Previous version kept at $PROTON_TOOLS_DIR/$installed (remove manually if not needed).${RESET}"
+    fi
+    )
+}
+
+# List installed GE-Proton versions
+list_proton_versions() {
+    local current dir name size found=0
+    current="$(proton_installed_version 2>/dev/null)"
+    if [ ! -d "$PROTON_TOOLS_DIR" ]; then
+        echo -e "${YELLOW}No GE-Proton installations found.${RESET}"
+        return 0
+    fi
+    while IFS= read -r dir; do
+        name="$(basename "$dir")"
+        size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+        if [ "$name" = "$current" ]; then
+            printf "  %-18s %6s  ${GREEN}(current)${RESET}\n" "$name" "${size:-?}"
+        else
+            printf "  %-18s %6s\n" "$name" "${size:-?}"
+        fi
+        found=1
+    done < <(find "$PROTON_TOOLS_DIR" -mindepth 1 -maxdepth 1 -type d -name 'GE-Proton*' 2>/dev/null | sort -V)
+    if [ "$found" -eq 0 ]; then
+        echo -e "  ${YELLOW}(none)${RESET}"
+    fi
+}
+
+# Remove one GE-Proton version (the active one is protected)
+remove_proton_version() {
+    local tag="${1:-}"
+    local current dir size answer
+
+    if [ -z "$tag" ]; then
+        echo -e "${RED}Usage: $0 remove-proton <version>${RESET}"
+        return 1
+    fi
+    if ! [[ "$tag" =~ ^GE-Proton[0-9A-Za-z._-]+$ ]] || [[ "$tag" == *..* ]]; then
+        echo -e "${RED}Invalid version name: $tag${RESET}"
+        return 1
+    fi
+
+    dir="$PROTON_TOOLS_DIR/$tag"
+    if [ ! -d "$dir" ]; then
+        echo -e "${RED}GE-Proton $tag is not installed in $PROTON_TOOLS_DIR.${RESET}"
+        return 1
+    fi
+    if [ "$(dirname "$(readlink -f "$dir")")" != "$(readlink -f "$PROTON_TOOLS_DIR")" ]; then
+        echo -e "${RED}Refusing to remove a path outside $PROTON_TOOLS_DIR.${RESET}"
+        return 1
+    fi
+
+    current="$(proton_installed_version 2>/dev/null)"
+    if [ "$tag" = "$current" ]; then
+        echo -e "${RED}$tag is the active GE-Proton version and cannot be removed.${RESET}"
+        echo -e "${YELLOW}Switch first (install/update-proton) or remove it manually after unlinking.${RESET}"
+        return 1
+    fi
+
+    size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+    read -rp "Remove $tag (${size:-unknown size})? [y/N] " answer
+    if [[ ! $answer =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Cancelled.${RESET}"
+        return 0
+    fi
+
+    rm -rf -- "$dir"
+    echo -e "${GREEN}Removed $tag.${RESET}"
+}
+
+# Remove all GE-Proton versions except the active one
+prune_proton_versions() {
+    local current dir name answer total
+    local -a old=()
+
+    current="$(proton_installed_version 2>/dev/null)"
+    if [ -z "$current" ]; then
+        echo -e "${RED}No active GE-Proton version (symlink missing); refusing to prune.${RESET}"
+        echo -e "${YELLOW}Run install-proton/update-proton or fix the GE-Proton symlink first.${RESET}"
+        return 1
+    fi
+    while IFS= read -r dir; do
+        name="$(basename "$dir")"
+        [ "$name" = "$current" ] && continue
+        old+=("$dir")
+    done < <(find "$PROTON_TOOLS_DIR" -mindepth 1 -maxdepth 1 -type d -name 'GE-Proton*' 2>/dev/null | sort -V)
+
+    if [ ${#old[@]} -eq 0 ]; then
+        echo -e "${YELLOW}No older GE-Proton versions to remove.${RESET}"
+        return 0
+    fi
+
+    total="$(du -shc "${old[@]}" 2>/dev/null | tail -1 | cut -f1)"
+    echo -e "${CYAN}Older versions:${RESET}"
+    for dir in "${old[@]}"; do
+        echo -e "  $(basename "$dir")"
+    done
+    read -rp "Remove ${#old[@]} version(s) (${total:-unknown size})? [y/N] " answer
+    if [[ ! $answer =~ ^[Yy]$ ]]; then
+        echo -e "${YELLOW}Cancelled.${RESET}"
+        return 0
+    fi
+
+    for dir in "${old[@]}"; do
+        rm -rf -- "$dir"
+        echo -e "${GREEN}Removed $(basename "$dir").${RESET}"
+    done
+}
+
+# Interactive GE-Proton version manager
+manage_proton_versions() {
+    local current dir name size choice tag i
+    local -a versions=()
+
+    while true; do
+        current="$(proton_installed_version 2>/dev/null)"
+        versions=()
+        while IFS= read -r dir; do
+            versions+=("$dir")
+        done < <(find "$PROTON_TOOLS_DIR" -mindepth 1 -maxdepth 1 -type d -name 'GE-Proton*' 2>/dev/null | sort -V)
+
+        echo -e "${CYAN}-------------------------------------${RESET}"
+        echo -e "${CYAN} GE-Proton versions               ${RESET}"
+        echo -e "${CYAN}-------------------------------------${RESET}"
+        echo -e "${CYAN}Directory:${RESET} ${YELLOW}$PROTON_TOOLS_DIR${RESET}"
+        echo -e "${CYAN}Active:${RESET}    ${YELLOW}${current:-none}${RESET}"
+        echo -e "${CYAN}-------------------------------------${RESET}"
+        if [ ${#versions[@]} -eq 0 ]; then
+            echo -e "  ${YELLOW}(no installed versions)${RESET}"
+        else
+            i=1
+            for dir in "${versions[@]}"; do
+                name="$(basename "$dir")"
+                size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+                if [ "$name" = "$current" ]; then
+                    printf "  %2d) %-18s %6s  ${GREEN}(current)${RESET}\n" "$i" "$name" "${size:-?}"
+                else
+                    printf "  %2d) %-18s %6s\n" "$i" "$name" "${size:-?}"
+                fi
+                i=$((i + 1))
+            done
+        fi
+        echo -e "${CYAN}-------------------------------------${RESET}"
+        echo -e "  ${GREEN}a) Remove all versions except the active one${RESET}"
+        echo -e "  ${GREEN}b) Back${RESET}"
+        read -rp "Remove version number, a, or b: " choice
+
+        case "$choice" in
+            ""|b|B)
+                return 0
+                ;;
+            a|A)
+                prune_proton_versions
+                ;;
+            *)
+                if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le ${#versions[@]} ]; then
+                    tag="$(basename "${versions[$((choice - 1))]}")"
+                    remove_proton_version "$tag"
+                else
+                    echo -e "${RED}Invalid selection.${RESET}"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Ensure Proton can find the native Steam client library
+ensure_steam_sdk() {
+    local lib="$BASE_DIR/steamcmd/linux64/steamclient.so"
+    if [ ! -f "$lib" ]; then
+        setup_steamcmd
+    fi
+    if [ ! -f "$lib" ]; then
+        echo -e "${RED}SteamCMD's linux64/steamclient.so is missing.${RESET}"
+        echo -e "${YELLOW}Run the server download once so SteamCMD initializes itself.${RESET}"
+        return 1
+    fi
+
+    mkdir -p "$STEAM_SDK_DIR" || return 1
+    if [ ! -e "$STEAM_SDK_DIR/steamclient.so" ]; then
+        [ -L "$STEAM_SDK_DIR/steamclient.so" ] && rm -f "$STEAM_SDK_DIR/steamclient.so"
+        ln -sfn "$lib" "$STEAM_SDK_DIR/steamclient.so" || return 1
+        echo -e "${GREEN}Linked Steam client library for Proton: $STEAM_SDK_DIR/steamclient.so${RESET}"
+    fi
+}
+
+# Check for the virtual X server required by Proton's launcher
+require_xvfb() {
+    if command -v xvfb-run >/dev/null 2>&1; then
+        return 0
+    fi
+    echo -e "${RED}xvfb-run is required to start the server with GE-Proton.${RESET}"
+    echo -e "${CYAN}Install it for your distribution:${RESET}"
+    echo -e "  ${MAGENTA}Debian/Ubuntu:${RESET} sudo apt-get install xvfb"
+    echo -e "  ${MAGENTA}openSUSE:${RESET}      sudo zypper install xvfb-run"
+    echo -e "  ${MAGENTA}Fedora:${RESET}        sudo dnf install xorg-x11-server-Xvfb"
+    echo -e "  ${MAGENTA}Arch:${RESET}          sudo pacman -S xorg-server-xvfb"
+    return 1
+}
+
+# Shared checks before launching Proton
+prepare_proton_start() {
+    if [ ! -f "$SERVER_DIR/$SERVER_EXECUTABLE" ]; then
+        echo -e "${RED}Server files not found. Run \"$0 update\" first.${RESET}"
+        return 1
+    fi
+    if [ ! -x "$PROTON_LINK/proton" ]; then
+        echo -e "${RED}GE-Proton is not installed. Run \"$0 install-proton\" first.${RESET}"
+        return 1
+    fi
+    require_xvfb || return 1
+    ensure_steam_sdk || return 1
+    mkdir -p "$PROTON_DATA_DIR" || return 1
+}
+
+# Start server with GE-Proton (optional runtime)
+start_proton() {
+    if server_running; then
+        echo -e "${YELLOW}The server is already running.${RESET}"
+        return
+    fi
+    prepare_proton_start || return 1
+
+    echo -e "${CYAN}Starting the server in the background using $(proton_installed_version 2>/dev/null || echo "GE-Proton")...${RESET}"
+    (
+        cd "$SERVER_DIR" || exit 1
+        export STEAM_COMPAT_CLIENT_INSTALL_PATH="$BASE_DIR/steamcmd"
+        export STEAM_COMPAT_DATA_PATH="$PROTON_DATA_DIR"
+        export PROTON_USE_XALIA=0
+        unset DISPLAY
+        nohup xvfb-run -a "$PROTON_LINK/proton" run "./$SERVER_EXECUTABLE" > "$BASE_DIR/server.log" 2>&1 &
+    )
+    if [ $? -eq 0 ]; then
+        echo -e "${GREEN}Server start initiated.${RESET}"
+        echo -e "${YELLOW}Logs are saved in server.log.${RESET}"
+        echo -e "${YELLOW}The first start creates the Proton prefix and can take a minute.${RESET}"
+    else
+        echo -e "${RED}Error starting the server.${RESET}"
+        return 1
+    fi
+}
+
+# Stop server (SIGINT -> graceful save, then TERM/KILL as fallback)
 stop_server() {
     echo -e "${CYAN}Stopping all processes related to the Enshrouded server...${RESET}"
-    pkill -f "$SERVER_EXECUTABLE"
-    if pgrep -f "$SERVER_EXECUTABLE" >/dev/null; then
+    if ! server_running; then
+        echo -e "${YELLOW}The server is not running.${RESET}"
+        return
+    fi
+
+    signal_servers INT
+    local waited=0
+    while server_running && [ $waited -lt 75 ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if server_running; then
+        echo -e "${YELLOW}Graceful shutdown timed out, sending SIGTERM...${RESET}"
+        signal_servers TERM
+        sleep 5
+    fi
+    if server_running; then
+        echo -e "${RED}Processes still alive, sending SIGKILL.${RESET}"
+        signal_servers KILL
+        sleep 1
+    fi
+
+    if server_running; then
         echo -e "${RED}Some server processes could not be stopped. Please check manually.${RESET}"
     else
         echo -e "${GREEN}Server successfully stopped.${RESET}"
@@ -198,6 +604,64 @@ restart_server() {
     start_server
 }
 
+# Restart server with GE-Proton
+restart_proton() {
+    echo -e "${CYAN}Restarting the server with GE-Proton...${RESET}"
+    stop_server
+    sleep 2
+    start_proton
+}
+
+# Find the Windows server process (comm is truncated to "enshrouded_serv")
+find_server_pid() {
+    local p
+    for p in $(pgrep -u "$SERVER_UID" -f "$SERVER_EXECUTABLE" 2>/dev/null); do
+        case "$(cat "/proc/$p/comm" 2>/dev/null)" in
+            enshrouded*) echo "$p"; return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Run server in the foreground (systemd); SIGTERM/SIGINT -> graceful save
+run_server() {
+    if server_running; then
+        echo -e "${YELLOW}The server is already running.${RESET}"
+        return 1
+    fi
+    prepare_proton_start || return 1
+
+    echo -e "${CYAN}Starting the server in the foreground using $(proton_installed_version 2>/dev/null || echo "GE-Proton")...${RESET}"
+    export STEAM_COMPAT_CLIENT_INSTALL_PATH="$BASE_DIR/steamcmd"
+    export STEAM_COMPAT_DATA_PATH="$PROTON_DATA_DIR"
+    export PROTON_USE_XALIA=0
+    unset DISPLAY
+    cd "$SERVER_DIR" || return 1
+
+    xvfb-run -a "$PROTON_LINK/proton" run "./$SERVER_EXECUTABLE" &
+    local launcher_pid=$!
+    local app_pid=""
+    local i
+    for i in $(seq 1 180); do
+        app_pid="$(find_server_pid)" && break
+        kill -0 "$launcher_pid" 2>/dev/null || break
+        sleep 1
+    done
+    if [ -z "$app_pid" ]; then
+        echo -e "${RED}Server process did not start.${RESET}"
+        wait "$launcher_pid" 2>/dev/null
+        return 1
+    fi
+    echo -e "${GREEN}Server running (PID $app_pid). Send SIGINT/SIGTERM for a graceful stop.${RESET}"
+
+    trap 'kill -INT "$app_pid" 2>/dev/null' INT TERM
+    while kill -0 "$app_pid" 2>/dev/null; do
+        sleep 2
+    done
+    wait "$launcher_pid" 2>/dev/null
+    echo -e "${CYAN}Server exited.${RESET}"
+}
+
 # Handle CLI arguments
 handle_arguments() {
     case "$1" in
@@ -207,15 +671,39 @@ handle_arguments() {
         start)
             start_server
             ;;
+        start-proton)
+            start_proton
+            ;;
         stop)
             stop_server
             ;;
         restart)
             restart_server
             ;;
+        restart-proton)
+            restart_proton
+            ;;
+        run|foreground)
+            run_server
+            ;;
+        install-proton|update-proton)
+            install_proton
+            ;;
+        list-proton|proton-versions)
+            list_proton_versions
+            ;;
+        remove-proton)
+            remove_proton_version "${2:-}"
+            ;;
+        prune-proton|remove-old-proton)
+            prune_proton_versions
+            ;;
+        manage-proton)
+            manage_proton_versions
+            ;;
         *)
             echo -e "${RED}Invalid argument: $1${RESET}"
-            echo -e "${YELLOW}Usage:${RESET} $0 {update|start|stop|restart}"
+            echo -e "${YELLOW}Usage:${RESET} $0 {update|start|start-proton|stop|restart|restart-proton|run|install-proton|update-proton|list-proton|remove-proton <version>|prune-proton|manage-proton}"
             exit 1
             ;;
     esac
@@ -224,16 +712,23 @@ handle_arguments() {
 # Main menu
 show_menu() {
     while true; do
+        local proton_version
+        proton_version="$(proton_installed_version 2>/dev/null)"
         echo -e "${CYAN}-------------------------------------${RESET}"
         echo -e "${CYAN} Enshrouded Server Management Script ${RESET}"
         echo -e "${CYAN}-------------------------------------${RESET}"
         echo -e "${CYAN}Server directory:${RESET} ${YELLOW}$SERVER_DIR${RESET}"
+        echo -e "${CYAN}GE-Proton:${RESET}        ${YELLOW}${proton_version:-not installed}${RESET}"
         echo -e "${CYAN}-------------------------------------${RESET}"
         echo -e "${GREEN}1) Download/Update server${RESET}"
-        echo -e "${GREEN}2) Start server${RESET}"
-        echo -e "${GREEN}3) Stop server${RESET}"
-        echo -e "${GREEN}4) Restart server${RESET}"
-        echo -e "${GREEN}5) Exit${RESET}"
+        echo -e "${GREEN}2) Start server (Wine)${RESET}"
+        echo -e "${GREEN}3) Start server (GE-Proton)${RESET}"
+        echo -e "${GREEN}4) Stop server${RESET}"
+        echo -e "${GREEN}5) Restart server (Wine)${RESET}"
+        echo -e "${GREEN}6) Restart server (GE-Proton)${RESET}"
+        echo -e "${GREEN}7) Install/Update GE-Proton${RESET}"
+        echo -e "${GREEN}8) Manage GE-Proton versions${RESET}"
+        echo -e "${GREEN}9) Exit${RESET}"
         echo -e "${CYAN}-------------------------------------${RESET}"
         read -rp "Choose an option: " choice
 
@@ -245,12 +740,24 @@ show_menu() {
                 start_server
                 ;;
             3)
-                stop_server
+                start_proton
                 ;;
             4)
-                restart_server
+                stop_server
                 ;;
             5)
+                restart_server
+                ;;
+            6)
+                restart_proton
+                ;;
+            7)
+                install_proton
+                ;;
+            8)
+                manage_proton_versions
+                ;;
+            9)
                 echo -e "${CYAN}Exiting the script.${RESET}"
                 exit 0
                 ;;
@@ -264,7 +771,7 @@ show_menu() {
 # Main program
 check_dependencies
 if [ $# -gt 0 ]; then
-    handle_arguments "$1"
+    handle_arguments "$@"
 else
     show_menu
 fi
